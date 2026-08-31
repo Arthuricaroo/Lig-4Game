@@ -1017,7 +1017,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::NetworkManager
   mode: 0
-  serverIP: 127.0.0.1
+  serverIP: 10.57.1.2
   port: 7777
   connected: 0
   clientPlayerY: 0
