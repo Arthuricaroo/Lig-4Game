@@ -1,9 +1,13 @@
 using System;
+using System.Collections.Concurrent;
+using System.Globalization;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 public class NetworkManager : MonoBehaviour
 {
@@ -14,70 +18,129 @@ public class NetworkManager : MonoBehaviour
         Client
     }
 
+    [Header("Rede")]
     public NetworkMode mode = NetworkMode.None;
 
     public string serverIP = "127.0.0.1";
     public int port = 7777;
 
+    [Header("Estado da conexão")]
+    public bool connected = false;
+    public bool isReadyToPlay = false;
+
+    // =========================================================
+    // SERVIDOR
+    // =========================================================
+
     private TcpListener server;
-    private TcpClient client;
-    private NetworkStream stream;
+    private TcpClient serverClient;
+    private NetworkStream serverStream;
 
     private Thread serverThread;
-    private Thread receiveThread;
+    private Thread serverReceiveThread;
 
-    public bool connected = false;
+    // =========================================================
+    // CLIENTE
+    // =========================================================
 
-    // Dados recebidos do cliente
-    public float clientPlayerY = 0f;
+    private TcpClient client;
+    private NetworkStream clientStream;
 
-    // Dados recebidos do servidor
-    public float player1Y;
-    public float player2Y;
-    public float ballX;
-    public float ballY;
-    public int score1;
-    public int score2;
+    private Thread clientThread;
+    private Thread clientReceiveThread;
 
-    void OnApplicationQuit()
+    // =========================================================
+    // DADOS RECEBIDOS
+    // =========================================================
+
+    public float player2Input = 0f;
+
+    public float player1Y = 0f;
+    public float player2Y = 0f;
+
+    public float ballX = 0f;
+    public float ballY = 0f;
+
+    public int score1 = 0;
+    public int score2 = 0;
+
+    private readonly object dataLock = new object();
+
+    private readonly ConcurrentQueue<string> receivedMessages =
+        new ConcurrentQueue<string>();
+
+    private bool shouldLoadGame = false;
+
+    // =========================================================
+    // INICIALIZAÇÃO
+    // =========================================================
+
+    void Awake()
     {
-        StopNetwork();
+        DontDestroyOnLoad(gameObject);
     }
 
-    // =========================
-    // SERVIDOR
-    // =========================
+    void Update()
+    {
+        // A troca de cena precisa acontecer na thread principal
+        if (shouldLoadGame)
+        {
+            shouldLoadGame = false;
+
+            if (SceneManager.GetActiveScene().name != "Pong")
+            {
+                SceneManager.LoadScene("Pong");
+            }
+        }
+
+        ProcessReceivedMessages();
+    }
+
+    // =========================================================
+    // INICIAR SERVIDOR
+    // =========================================================
 
     public void StartServer()
     {
+        if (mode != NetworkMode.None)
+            return;
+
         mode = NetworkMode.Server;
 
-        serverThread = new Thread(ServerLoop);
+        Debug.Log("Iniciando servidor...");
+
+        serverThread = new Thread(ServerThread);
         serverThread.IsBackground = true;
         serverThread.Start();
-
-        Debug.Log("Iniciando servidor...");
     }
 
-    void ServerLoop()
+    private void ServerThread()
     {
         try
         {
             server = new TcpListener(IPAddress.Any, port);
+
             server.Start();
 
             Debug.Log("Servidor iniciado na porta " + port);
 
-            client = server.AcceptTcpClient();
+            Debug.Log("Aguardando Jogador 2...");
 
-            Debug.Log("Cliente conectado!");
+            serverClient = server.AcceptTcpClient();
 
-            stream = client.GetStream();
+            serverStream = serverClient.GetStream();
+
             connected = true;
 
-            receiveThread = new Thread(ReceiveFromClient);
-            receiveThread.IsBackground = true;
-            receiveThread.Start();
+            Debug.Log("Jogador 2 conectado!");
+
+            shouldLoadGame = true;
+
+            serverReceiveThread =
+                new Thread(ServerReceiveThread);
+
+            serverReceiveThread.IsBackground = true;
+            serverReceiveThread.Start();
         }
         catch (Exception e)
         {
@@ -85,43 +148,74 @@ public class NetworkManager : MonoBehaviour
         }
     }
 
-    void ReceiveFromClient()
+    // =========================================================
+    // RECEBER DADOS DO CLIENTE
+    // =========================================================
+
+    private void ServerReceiveThread()
     {
-        byte[] buffer = new byte[1024];
-
-        while (connected)
+        try
         {
-            try
+            using (StreamReader reader =
+                   new StreamReader(serverStream, Encoding.UTF8))
             {
-                int bytes = stream.Read(buffer, 0, buffer.Length);
-
-                if (bytes <= 0)
-                    break;
-
-                string message = Encoding.UTF8.GetString(buffer, 0, bytes);
-
-                if (message.StartsWith("P2:"))
+                while (connected)
                 {
-                    string value = message.Substring(3);
+                    string message = reader.ReadLine();
 
-                    if (float.TryParse(
-                        value,
-                        System.Globalization.NumberStyles.Float,
-                        System.Globalization.CultureInfo.InvariantCulture,
-                        out float y))
-                    {
-                        clientPlayerY = y;
-                    }
+                    if (message == null)
+                        break;
+
+                    receivedMessages.Enqueue(message);
                 }
             }
-            catch
-            {
-                break;
-            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("Erro recebendo dados do cliente: " + e.Message);
         }
 
         connected = false;
     }
+
+    // =========================================================
+    // PROCESSAR MENSAGENS RECEBIDAS
+    // =========================================================
+
+    private void ProcessReceivedMessages()
+    {
+        while (receivedMessages.TryDequeue(out string message))
+        {
+            if (message.StartsWith("INPUT|"))
+            {
+                string[] parts = message.Split('|');
+
+                if (parts.Length >= 2)
+                {
+                    if (float.TryParse(
+                        parts[1],
+                        NumberStyles.Float,
+                        CultureInfo.InvariantCulture,
+                        out float input))
+                    {
+                        lock (dataLock)
+                        {
+                            player2Input = Mathf.Clamp(input, -1f, 1f);
+                        }
+                    }
+                }
+            }
+
+            if (message == "READY")
+            {
+                isReadyToPlay = true;
+            }
+        }
+    }
+
+    // =========================================================
+    // ENVIAR ESTADO DO JOGO
+    // =========================================================
 
     public void SendGameState(
         float p1Y,
@@ -134,58 +228,63 @@ public class NetworkManager : MonoBehaviour
         if (mode != NetworkMode.Server)
             return;
 
-        if (!connected || stream == null)
+        if (!connected || serverStream == null)
             return;
 
         string message =
             "STATE|" +
-            p1Y.ToString(System.Globalization.CultureInfo.InvariantCulture) + "|" +
-            p2Y.ToString(System.Globalization.CultureInfo.InvariantCulture) + "|" +
-            bX.ToString(System.Globalization.CultureInfo.InvariantCulture) + "|" +
-            bY.ToString(System.Globalization.CultureInfo.InvariantCulture) + "|" +
+            p1Y.ToString(CultureInfo.InvariantCulture) + "|" +
+            p2Y.ToString(CultureInfo.InvariantCulture) + "|" +
+            bX.ToString(CultureInfo.InvariantCulture) + "|" +
+            bY.ToString(CultureInfo.InvariantCulture) + "|" +
             s1 + "|" +
             s2;
 
-        try
-        {
-            byte[] data = Encoding.UTF8.GetBytes(message);
-            stream.Write(data, 0, data.Length);
-        }
-        catch
-        {
-            connected = false;
-        }
+        SendLine(serverStream, message);
     }
 
-    // =========================
-    // CLIENTE
-    // =========================
+    // =========================================================
+    // CONECTAR COMO CLIENTE
+    // =========================================================
 
     public void ConnectToServer()
     {
+        if (mode != NetworkMode.None)
+            return;
+
         mode = NetworkMode.Client;
 
-        receiveThread = new Thread(ClientConnect);
-        receiveThread.IsBackground = true;
-        receiveThread.Start();
+        Debug.Log("Conectando ao servidor " + serverIP);
+
+        clientThread = new Thread(ClientConnectThread);
+        clientThread.IsBackground = true;
+        clientThread.Start();
     }
 
-    void ClientConnect()
+    private void ClientConnectThread()
     {
         try
         {
             client = new TcpClient();
 
-            Debug.Log("Conectando ao servidor " + serverIP);
-
             client.Connect(serverIP, port);
 
-            stream = client.GetStream();
+            clientStream = client.GetStream();
+
             connected = true;
 
             Debug.Log("Conectado ao servidor!");
 
-            ReceiveGameState();
+            // Informa que o cliente está pronto
+            SendLine(clientStream, "READY");
+
+            shouldLoadGame = true;
+
+            clientReceiveThread =
+                new Thread(ClientReceiveThread);
+
+            clientReceiveThread.IsBackground = true;
+            clientReceiveThread.Start();
         }
         catch (Exception e)
         {
@@ -193,81 +292,116 @@ public class NetworkManager : MonoBehaviour
         }
     }
 
-    void ReceiveGameState()
+    // =========================================================
+    // RECEBER ESTADO DO SERVIDOR
+    // =========================================================
+
+    private void ClientReceiveThread()
     {
-        byte[] buffer = new byte[2048];
-
-        while (connected)
+        try
         {
-            try
+            using (StreamReader reader =
+                   new StreamReader(clientStream, Encoding.UTF8))
             {
-                int bytes = stream.Read(buffer, 0, buffer.Length);
-
-                if (bytes <= 0)
-                    break;
-
-                string message = Encoding.UTF8.GetString(buffer, 0, bytes);
-
-                if (message.StartsWith("STATE|"))
+                while (connected)
                 {
-                    string[] data = message.Split('|');
+                    string message = reader.ReadLine();
 
-                    if (data.Length >= 7)
-                    {
-                        float.TryParse(
-                            data[1],
-                            System.Globalization.NumberStyles.Float,
-                            System.Globalization.CultureInfo.InvariantCulture,
-                            out player1Y);
+                    if (message == null)
+                        break;
 
-                        float.TryParse(
-                            data[2],
-                            System.Globalization.NumberStyles.Float,
-                            System.Globalization.CultureInfo.InvariantCulture,
-                            out player2Y);
-
-                        float.TryParse(
-                            data[3],
-                            System.Globalization.NumberStyles.Float,
-                            System.Globalization.CultureInfo.InvariantCulture,
-                            out ballX);
-
-                        float.TryParse(
-                            data[4],
-                            System.Globalization.NumberStyles.Float,
-                            System.Globalization.CultureInfo.InvariantCulture,
-                            out ballY);
-
-                        int.TryParse(data[5], out score1);
-                        int.TryParse(data[6], out score2);
-                    }
+                    receivedMessages.Enqueue(message);
                 }
             }
-            catch
-            {
-                break;
-            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("Erro recebendo estado: " + e.Message);
         }
 
         connected = false;
     }
 
-    public void SendPlayer2Position(float y)
+    // =========================================================
+    // PROCESSAMENTO DO ESTADO DO SERVIDOR
+    // =========================================================
+
+    private void ProcessStateMessage(string message)
+    {
+        string[] parts = message.Split('|');
+
+        if (parts.Length < 7)
+            return;
+
+        float.TryParse(
+            parts[1],
+            NumberStyles.Float,
+            CultureInfo.InvariantCulture,
+            out float p1);
+
+        float.TryParse(
+            parts[2],
+            NumberStyles.Float,
+            CultureInfo.InvariantCulture,
+            out float p2);
+
+        float.TryParse(
+            parts[3],
+            NumberStyles.Float,
+            CultureInfo.InvariantCulture,
+            out float bx);
+
+        float.TryParse(
+            parts[4],
+            NumberStyles.Float,
+            CultureInfo.InvariantCulture,
+            out float by);
+
+        int.TryParse(parts[5], out int s1);
+        int.TryParse(parts[6], out int s2);
+
+        lock (dataLock)
+        {
+            player1Y = p1;
+            player2Y = p2;
+
+            ballX = bx;
+            ballY = by;
+
+            score1 = s1;
+            score2 = s2;
+        }
+    }
+
+    // =========================================================
+    // ENVIAR INPUT DO PLAYER 2
+    // =========================================================
+
+    public void SendPlayer2Input(float input)
     {
         if (mode != NetworkMode.Client)
             return;
 
-        if (!connected || stream == null)
+        if (!connected || clientStream == null)
             return;
 
         string message =
-            "P2:" +
-            y.ToString(
-                System.Globalization.CultureInfo.InvariantCulture);
+            "INPUT|" +
+            input.ToString(CultureInfo.InvariantCulture);
 
+        SendLine(clientStream, message);
+    }
+
+    // =========================================================
+    // ENVIO TCP
+    // =========================================================
+
+    private void SendLine(NetworkStream stream, string message)
+    {
         try
         {
-            byte[] data = Encoding.UTF8.GetBytes(message);
+            byte[] data =
+                Encoding.UTF8.GetBytes(message + "\n");
 
             stream.Write(data, 0, data.Length);
         }
@@ -277,24 +411,135 @@ public class NetworkManager : MonoBehaviour
         }
     }
 
+    // =========================================================
+    // PROCESSAMENTO DE MENSAGENS
+    // =========================================================
+
+    private void ProcessMessageType(string message)
+    {
+        if (message.StartsWith("STATE|"))
+        {
+            ProcessStateMessage(message);
+        }
+    }
+
+    // =========================================================
+    // ATUALIZAÇÃO DO PROCESSAMENTO
+    // =========================================================
+
+    void LateUpdate()
+    {
+        while (receivedMessages.TryDequeue(out string message))
+        {
+            if (message.StartsWith("STATE|"))
+            {
+                ProcessStateMessage(message);
+            }
+            else if (message.StartsWith("INPUT|"))
+            {
+                string[] parts = message.Split('|');
+
+                if (parts.Length >= 2 &&
+                    float.TryParse(
+                        parts[1],
+                        NumberStyles.Float,
+                        CultureInfo.InvariantCulture,
+                        out float input))
+                {
+                    lock (dataLock)
+                    {
+                        player2Input =
+                            Mathf.Clamp(input, -1f, 1f);
+                    }
+                }
+            }
+        }
+    }
+
+    // =========================================================
+    // PARAR REDE
+    // =========================================================
+
     public void StopNetwork()
     {
         connected = false;
 
         try
         {
-            stream?.Close();
-            client?.Close();
+            serverStream?.Close();
+            serverClient?.Close();
             server?.Stop();
 
-            if (serverThread != null && serverThread.IsAlive)
-                serverThread.Abort();
-
-            if (receiveThread != null && receiveThread.IsAlive)
-                receiveThread.Abort();
+            clientStream?.Close();
+            client?.Close();
         }
         catch
         {
+        }
+    }
+
+    void OnApplicationQuit()
+    {
+        StopNetwork();
+    }
+
+    // =========================================================
+    // MÉTODOS PÚBLICOS
+    // =========================================================
+
+    public float GetPlayer2Input()
+    {
+        lock (dataLock)
+        {
+            return player2Input;
+        }
+    }
+
+    public float GetPlayer1Y()
+    {
+        lock (dataLock)
+        {
+            return player1Y;
+        }
+    }
+
+    public float GetPlayer2Y()
+    {
+        lock (dataLock)
+        {
+            return player2Y;
+        }
+    }
+
+    public float GetBallX()
+    {
+        lock (dataLock)
+        {
+            return ballX;
+        }
+    }
+
+    public float GetBallY()
+    {
+        lock (dataLock)
+        {
+            return ballY;
+        }
+    }
+
+    public int GetScore1()
+    {
+        lock (dataLock)
+        {
+            return score1;
+        }
+    }
+
+    public int GetScore2()
+    {
+        lock (dataLock)
+        {
+            return score2;
         }
     }
 }
